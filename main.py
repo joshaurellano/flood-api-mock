@@ -51,19 +51,75 @@ transition and fire an alert live during a short demo window. Either:
       before the presentation, or
   (b) manually invoke poll-flood / check-forecast (a plain curl/Postman
       call to their URLs) at the right moment in your talk instead of
-      waiting on their cron schedules.
+      waiting on their cron schedules, or
+  (c) use the phase-locking feature below to hold the mock in one
+      phase indefinitely so you (or the Edge Function's cron) don't
+      have to race the 5-minute loop at all.
 Either way, the mock's job is just to make predict-flood/forecast-flood
 LOOK right when the frontend (or your manually-triggered Edge Function)
 reads it -- it doesn't control when those functions decide to look.
+
+── PHASE LOCKING (new) — for testing the 3-day-forecast alert ─────────
+By default the mock free-runs through the 5-phase cycle above, so the
+"BREWING" window (today NORMAL, day_ahead 1-2 WARNING/CRITICAL) — the
+exact scenario the 3-day-forecast alert is meant to catch — only exists
+for 1/5th of the cycle and then moves on. That's a moving target if
+you're trying to confirm the Edge Function's 3-day-crossing logic
+actually fires.
+
+You can now pin the mock to one phase and leave it there:
+
+  1. Per-request (no redeploy needed) — add a `phase` query param to
+     any endpoint:
+         GET /api/forecast-flood?phase=brewing
+         GET /api/predict-flood?phase=brewing
+         GET /api/forecast?phase=brewing
+     Accepts either the phase name (calm, brewing, rising, sustained,
+     recovering — case-insensitive) or its index (0-4). While locked,
+     the response still animates smoothly WITHIN that phase (looping
+     every phase_len = CYCLE_SECONDS/5 seconds) — it isn't a single
+     frozen snapshot, so repeated polls still look "live" and today
+     stays NORMAL / day_ahead 1-2 stay WARNING+ the whole time you're
+     testing.
+
+  2. Whole-deployment default — set the env var MOCK_FORCE_PHASE
+     (e.g. `MOCK_FORCE_PHASE=brewing` or `MOCK_FORCE_PHASE=1`) before
+     starting the server, so every request is locked to that phase
+     unless a request overrides it with its own `?phase=` param. Unset
+     (default) = free-running 5-phase cycle as before.
+
+  3. To go back to the normal free-running cycle for a request, either
+     don't pass `phase`, or pass `phase=cycle` / `phase=auto`.
+
+This only changes WHICH phase is being read; it doesn't change any of
+the underlying probability curves, field shapes, or thresholds, so the
+frontend/Edge Functions still see exactly the same kind of payload they
+would during a normal free-running demo — just held on the moment you
+want to test against instead of cycling past it.
 ──────────────────────────────────────────────────────────────────────
 """
 
+import contextvars
 import datetime
 import os
 import time
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from dotenv import load_dotenv
+    # Looks for a .env file in the current working directory (or wherever
+    # you point it with load_dotenv(dotenv_path=...)) and copies its
+    # key=value lines into os.environ *before* we read MOCK_FORCE_PHASE /
+    # MOCK_CYCLE_SECONDS below. Safe no-op if no .env file exists.
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed in this environment -- env vars set the
+    # normal way (shell export, docker-compose, host platform config, etc.)
+    # still work fine; only a .env file specifically would be ignored.
+    pass
 
 app = FastAPI(
     title="AGOS Mock Flood API — Demo Mode",
@@ -93,6 +149,48 @@ MODEL_REGISTRY = {
 }
 DEFAULT_MODEL_KEY = "gru"
 
+PHASE_NAMES = ["calm", "brewing", "rising", "sustained", "recovering"]
+PHASE_DISPLAY_NAMES = [
+    "CALM",
+    "BREWING (3-day forecast rising)",
+    "RISING (today climbing)",
+    "SUSTAINED (still elevated)",
+    "RECOVERING (downgrade w/ residual risk)",
+]
+
+
+def _resolve_phase_token(value) -> Optional[int]:
+    """Turn 'brewing' / 'BREWING' / '1' / 1 into a phase index 0-4, or
+    None if the value doesn't map to a phase (e.g. 'cycle'/'auto'/empty)."""
+    if value is None:
+        return None
+    token = str(value).strip().lower()
+    if token in ("", "cycle", "auto", "none"):
+        return None
+    if token in PHASE_NAMES:
+        return PHASE_NAMES.index(token)
+    try:
+        idx = int(token)
+    except ValueError:
+        return None
+    return idx if 0 <= idx <= 4 else None
+
+
+# Deployment-wide default lock, e.g. MOCK_FORCE_PHASE=brewing
+_ENV_FORCE_PHASE = _resolve_phase_token(os.environ.get("MOCK_FORCE_PHASE"))
+
+# Per-request override (set at the top of each endpoint from the `phase`
+# query param). Falls back to _ENV_FORCE_PHASE when unset for a request.
+_forced_phase_ctx: "contextvars.ContextVar[Optional[int]]" = contextvars.ContextVar(
+    "forced_phase", default=None
+)
+
+
+def _apply_phase_override(phase: Optional[str]) -> None:
+    """Call at the top of every endpoint with its `phase` query param."""
+    override = _resolve_phase_token(phase)
+    _forced_phase_ctx.set(override if override is not None else _ENV_FORCE_PHASE)
+
 
 def _now():
     return datetime.datetime.now()
@@ -104,8 +202,18 @@ def _elapsed() -> float:
 
 
 def _phase_fraction(elapsed: float) -> tuple:
-    """Returns (phase_index 0-4, progress 0.0-1.0 within that phase)."""
+    """Returns (phase_index 0-4, progress 0.0-1.0 within that phase).
+
+    If a phase is locked (via ?phase= query param or MOCK_FORCE_PHASE
+    env var), phase_index is pinned to that value and progress simply
+    loops within that one phase's window every phase_len seconds, so
+    values keep animating instead of freezing on one exact number.
+    """
     phase_len = CYCLE_SECONDS / 5.0
+    forced = _forced_phase_ctx.get()
+    if forced is not None:
+        progress = (elapsed % phase_len) / phase_len
+        return forced, progress
     phase = min(int(elapsed // phase_len), 4)
     progress = (elapsed - phase * phase_len) / phase_len
     return phase, max(0.0, min(1.0, progress))
@@ -348,22 +456,26 @@ def _forecast_response(model_key: str) -> dict:
 # GET /api/forecast-flood/{gru,lstm,cnn} + default + compare
 # ===========================================================================
 @app.get("/api/forecast-flood/gru")
-def forecast_flood_gru():
+def forecast_flood_gru(phase: Optional[str] = Query(default=None)):
+    _apply_phase_override(phase)
     return _forecast_response("gru")
 
 
 @app.get("/api/forecast-flood/lstm")
-def forecast_flood_lstm():
+def forecast_flood_lstm(phase: Optional[str] = Query(default=None)):
+    _apply_phase_override(phase)
     return _forecast_response("lstm")
 
 
 @app.get("/api/forecast-flood/cnn")
-def forecast_flood_cnn():
+def forecast_flood_cnn(phase: Optional[str] = Query(default=None)):
+    _apply_phase_override(phase)
     return _forecast_response("cnn")
 
 
 @app.get("/api/forecast-flood/compare")
-def forecast_flood_compare():
+def forecast_flood_compare(phase: Optional[str] = Query(default=None)):
+    _apply_phase_override(phase)
     elapsed = _elapsed()
     keys = list(MODEL_REGISTRY.keys())
     per_model = {k: {"label": MODEL_REGISTRY[k]["label"], "meta": meta_block(k), "forecast": _build_forecast_entries(elapsed)} for k in keys}
@@ -404,7 +516,8 @@ def forecast_flood_compare():
 
 
 @app.get("/api/forecast-flood")
-def forecast_flood_default():
+def forecast_flood_default(phase: Optional[str] = Query(default=None)):
+    _apply_phase_override(phase)
     return _forecast_response(DEFAULT_MODEL_KEY)
 
 
@@ -428,12 +541,14 @@ def _predict_response(model_key: str) -> dict:
 
 
 @app.get("/api/predict-flood")
-def predict_flood():
+def predict_flood(phase: Optional[str] = Query(default=None)):
+    _apply_phase_override(phase)
     return _predict_response(DEFAULT_MODEL_KEY)
 
 
 @app.get("/api/predict-flood/{model_key}")
-def predict_flood_for_model(model_key: str):
+def predict_flood_for_model(model_key: str, phase: Optional[str] = Query(default=None)):
+    _apply_phase_override(phase)
     if model_key not in MODEL_REGISTRY:
         raise HTTPException(status_code=404, detail=f"Unknown model '{model_key}'. Valid options: {list(MODEL_REGISTRY)}")
     return _predict_response(model_key)
@@ -453,7 +568,8 @@ def _wmo_for_level(level: str) -> tuple:
 
 
 @app.get("/api/forecast")
-def get_forecast():
+def get_forecast(phase: Optional[str] = Query(default=None)):
+    _apply_phase_override(phase)
     elapsed = _elapsed()
     now = _now().replace(minute=0, second=0, microsecond=0)
     probs = build_forecast_probs(elapsed)
@@ -552,19 +668,24 @@ def get_forecast():
 # current demo phase so you can glance at it and know where the cycle is
 # ===========================================================================
 @app.get("/health")
-def health():
+def health(phase: Optional[str] = Query(default=None)):
+    _apply_phase_override(phase)
     elapsed = _elapsed()
-    phase, progress = _phase_fraction(elapsed)
-    phase_names = ["CALM", "BREWING (3-day forecast rising)", "RISING (today climbing)", "SUSTAINED (still elevated)", "RECOVERING (downgrade w/ residual risk)"]
+    phase_idx, progress = _phase_fraction(elapsed)
     return {
         "status": "ok",
         "remote_model_reachable": True,
         "model_loaded": True,
         "mode": "MOCK — Demo/Defense Presentation Mode",
-        "demo_phase": phase_names[phase],
+        "demo_phase": PHASE_DISPLAY_NAMES[phase_idx],
         "demo_phase_progress": round(progress, 2),
         "demo_cycle_seconds": CYCLE_SECONDS,
         "demo_seconds_elapsed_in_cycle": round(elapsed, 1),
+        "demo_phase_locked": _forced_phase_ctx.get() is not None,
+        "demo_phase_lock_source": (
+            "query_param" if _resolve_phase_token(phase) is not None
+            else ("env:MOCK_FORCE_PHASE" if _ENV_FORCE_PHASE is not None else None)
+        ),
     }
 
 
